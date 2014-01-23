@@ -66,6 +66,8 @@ public class MemoryChannel extends BasicChannelSemantics {
     private final ChannelCounter channelCounter;
     private int putByteCounter = 0;
     private int takeByteCounter = 0;
+      // The interval to check for overload      
+      private double interval = 0.1;
 
     public MemoryTransaction(int transCapacity, ChannelCounter counter) {
       putList = new LinkedBlockingDeque<Event>(transCapacity);
@@ -79,11 +81,18 @@ public class MemoryChannel extends BasicChannelSemantics {
       channelCounter.incrementEventPutAttemptCount();
       int eventByteSize = (int)Math.ceil(estimateEventSize(event)/byteCapacitySlotSize);
 
-      if (!putList.offer(event)) {
-        throw new ChannelException(
-          "Put queue for MemoryTransaction of capacity " +
-            putList.size() + " full, consider committing more frequently, " +
-            "increasing capacity or increasing thread count");
+      if (bytesRemaining.tryAcquire(eventByteSize, keepAlive, TimeUnit.SECONDS)) {
+        if(!putList.offer(event)) {
+          throw new ChannelException("Put queue for MemoryTransaction of capacity " +
+              putList.size() + " full, consider committing more frequently, " +
+              "increasing capacity or increasing thread count");
+        }
+      } else {
+        throw new ChannelException("Put queue for MemoryTransaction of byteCapacity " +
+            (lastByteCapacity * (int)byteCapacitySlotSize) + " bytes cannot add an " +
+            " event of size " + estimateEventSize(event) + " bytes because " +
+             (bytesRemaining.availablePermits() * (int)byteCapacitySlotSize) + " bytes are already used." +
+            " Try consider comitting more frequently, increasing byteCapacity or increasing thread count");
       }
       putByteCounter += eventByteSize;
     }
@@ -113,19 +122,32 @@ public class MemoryChannel extends BasicChannelSemantics {
       return event;
     }
 
+      private void logStats(long currentTime)
+      {
+	  double inputRate = channelCounter.getInputRate(currentTime);
+	  double outputRate = channelCounter.getOutputRate(currentTime);	        
+	  LOGGER.info("[CHANNEL] Current occupancy " + channelCounter.getChannelSize());
+	  LOGGER.info("[CHANNEL] Total capacity " + channelCounter.getChannelCapacity());
+	  LOGGER.info("[CHANNEL] Fill percentage " + channelCounter.getChannelFillPercentage());
+	  LOGGER.info("[CHANNEL] Total added " + channelCounter.getEventPutSuccessCount());
+	  LOGGER.info("[CHANNEL] Total removed " + channelCounter.getEventTakeSuccessCount());
+	  LOGGER.info("[CHANNEL] Newly added " + channelCounter.getInputCount());
+	  LOGGER.info("[CHANNEL] Newly removed " + channelCounter.getOutputCount());
+	  LOGGER.info("[CHANNEL] Input rate " + inputRate);
+	  LOGGER.info("[CHANNEL] Output rate " + outputRate);
+	  LOGGER.info("[CHANNEL] Overload estimate: "  + channelCounter.getOverloadEstimate(currentTime));
+	  LOGGER.info("[CHANNEL] Wait time: "  + channelCounter.getWaitTime(currentTime));
+	  if(inputRate==0.0&&outputRate==0.0)
+	      channelCounter.resetStats(currentTime);
+	  // Simpler reset for interval checking 
+	  channelCounter.setLastReset(currentTime);	  	  
+      }
+
     @Override
     protected void doCommit() throws InterruptedException {
       int remainingChange = takeList.size() - putList.size();
       if(remainingChange < 0) {
-        if(!bytesRemaining.tryAcquire(putByteCounter, keepAlive,
-          TimeUnit.SECONDS)) {
-          throw new ChannelException("Cannot commit transaction. Heap space " +
-            "limit of " + byteCapacity + "reached. Please increase heap space" +
-            " allocated to the channel as the sinks may not be keeping up " +
-            "with the sources");
-        }
         if(!queueRemaining.tryAcquire(-remainingChange, keepAlive, TimeUnit.SECONDS)) {
-          bytesRemaining.release(putByteCounter);
           throw new ChannelException("Space for commit to queue couldn't be acquired" +
               " Sinks are likely not keeping up with sources, or the buffer size is too tight");
         }
@@ -159,6 +181,14 @@ public class MemoryChannel extends BasicChannelSemantics {
       }
 
       channelCounter.setChannelSize(queue.size());
+      
+      long currentTime = System.currentTimeMillis();
+      // Compute stats only if more than an 'interval' amount of time has passed
+      if((currentTime-channelCounter.getLastReset()) > (interval * 1000))
+          {
+	      logStats(currentTime);
+	  }
+
     }
 
     @Override
@@ -222,6 +252,9 @@ public class MemoryChannel extends BasicChannelSemantics {
    */
   @Override
   public void configure(Context context) {
+
+      Context subContext = new Context(context.getSubProperties("balancer."));
+
     Integer capacity = null;
     try {
       capacity = context.getInteger("capacity", defaultCapacity);
@@ -347,6 +380,7 @@ public class MemoryChannel extends BasicChannelSemantics {
     channelCounter.setChannelSize(queue.size());
     channelCounter.setChannelCapacity(Long.valueOf(
             queue.size() + queue.remainingCapacity()));
+    channelCounter.resetStats(System.currentTimeMillis());
     super.start();
   }
 
